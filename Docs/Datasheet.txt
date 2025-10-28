@@ -1,0 +1,1 @@
+line sensor = https://www.pololu.com/docs/pdf/0j12/qtr-8x.pdf
