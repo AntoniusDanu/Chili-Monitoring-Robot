@@ -14,12 +14,12 @@
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
 
-#define WIFI_SSID       "vivo Y33S"//"BRT Juken"
-#define WIFI_PASS       "arduinouno"//"A1b2c3d4e5"
+#define WIFI_SSID       ""//"BRT Juken"
+#define WIFI_PASS       "pastibisaaa233"//"A1b2c3d4e5"
 #define TAG "ESP32-CAM"
 #define LED_GPIO        GPIO_NUM_4
-//#define PIT_ID          4  // Ganti sesuai ID PIT (0=P1, 1=P2, dst)
-#define BACKEND_URL     "http://192.168.57.84:8000/chili/upload"      
+
+#define BACKEND_URL     "http://leafiot.ksmiotupnvj.com:8000/chili/upload"      
 
 #define PWDN_GPIO_NUM   32
 #define RESET_GPIO_NUM  -1
@@ -297,7 +297,7 @@ static esp_err_t init_camera(void) {
     }
     //---Konfigurasi lensa camera----
     sensor_t *s = esp_camera_sensor_get();
-    s->set_vflip(s, 0);
+    s->set_vflip(s, 1);
     s->set_hmirror(s, 0);
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
