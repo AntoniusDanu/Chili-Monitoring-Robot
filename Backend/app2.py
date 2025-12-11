@@ -1,0 +1,282 @@
+import os
+from uuid import uuid4
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from ultralytics import YOLO
+from pydantic import BaseModel
+from PIL import Image
+import uuid
+
+# ============================================
+# DEFINISIKAN FASTAPI APP  **FIX**
+# ============================================
+app = FastAPI()
+
+# Optional CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================
+# KONFIGURASI
+# ============================================
+UPLOAD_DIR = "chili_uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Load YOLO Model
+chili_model = YOLO("bestchili.pt")
+
+# State Global
+chili_state = {
+    "last_image": None,
+    "last_pred": None,
+    "count_total": 0,
+    "count_ripe": 0,
+    "count_unripe": 0
+}
+
+# ============================================
+# Fungsi preprocessing ROTATE 90°
+# ============================================
+def preprocess_and_rotate(image_path):
+    img = Image.open(image_path)
+    img = img.rotate(-90, expand=True)
+    img.save(image_path)
+    return image_path
+
+# ============================================
+# Render YOLO Bounding Box
+# ============================================
+def save_detected_image(result, src_path):
+    try:
+        out_path = src_path.replace(".jpg", "_det.jpg")
+        result.save(filename=out_path)
+        return out_path
+    except Exception as e:
+        print("Render error:", e)
+        return src_path
+
+# ============================================
+# Analisis hasil YOLO
+# ============================================
+def analyze_chili_boxes(result):
+    boxes = result.boxes
+    if len(boxes) == 0:
+        return -1, 0, 0, 0
+
+    total = len(boxes)
+    ripe = sum(1 for b in boxes if int(b.cls) == 0)
+    unripe = sum(1 for b in boxes if int(b.cls) == 1)
+    best = max(boxes, key=lambda x: float(x.conf))
+    best_class = int(best.cls)
+
+    return best_class, total, ripe, unripe
+
+# ============================================
+# Auto Cleanup
+# ============================================
+def cleanup_uploads(max_files=100):
+    files = sorted(
+        [os.path.join(UPLOAD_DIR, f) for f in os.listdir(UPLOAD_DIR)],
+        key=os.path.getctime
+    )
+    if len(files) > max_files:
+        for f in files[:-max_files]:
+            os.remove(f)
+
+# ============================================
+# Upload Endpoint
+# ============================================
+@app.post("/chili/upload")
+async def upload_chili(file: UploadFile = File(...)):
+    filename = f"{uuid4()}.jpg"
+    filepath = os.path.join(UPLOAD_DIR, filename)
+
+    with open(filepath, "wb") as f:
+        f.write(await file.read())
+
+    cleanup_uploads()
+    preprocess_and_rotate(filepath)
+
+    try:
+        result = chili_model.predict(filepath, verbose=False)[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+
+    ripeness, total, ripe, unripe = analyze_chili_boxes(result)
+    detected_path = save_detected_image(result, filepath)
+
+    chili_state["last_image"] = detected_path
+    chili_state["last_pred"] = ripeness
+    chili_state["count_total"] = total
+    chili_state["count_ripe"] = ripe
+    chili_state["count_unripe"] = unripe
+
+    return {
+        "status": "ok",
+        "ripeness": ripeness,
+        "total_detected": total,
+        "ripe": ripe,
+        "unripe": unripe,
+        "note": "0=ripe, 1=unripe, -1=no chili"
+    }
+
+# ============================================
+# Status JSON
+# ============================================
+@app.get("/chili/status")
+def chili_status():
+    return {
+        "last_pred": chili_state["last_pred"],
+        "total_detected": chili_state["count_total"],
+        "ripe": chili_state["count_ripe"],
+        "unripe": chili_state["count_unripe"],
+        "note": "0=ripe, 1=unripe, -1=no chili"
+    }
+
+# ============================================
+# Endpoint Gambar
+# ============================================
+@app.get("/chili/image")
+def chili_image():
+    if chili_state["last_image"] is None:
+        raise HTTPException(status_code=404, detail="No image yet")
+    return FileResponse(chili_state["last_image"])
+    
+# ============================================
+# Halaman Web Viewer
+# ============================================
+@app.get("/chili/view", response_class=HTMLResponse)
+def chili_view():
+    return """
+    <html>
+    <head><title>Chili Viewer</title>
+    <style>
+        body { font-family: Arial; }
+        .container {
+            display: flex;
+            flex-direction: row;
+            gap: 30px;
+            align-items: flex-start;
+        }
+        .card {
+            padding: 15px;
+            border: 1px solid #ccc;
+            border-radius: 10px;
+            width: 300px;
+            background: #f8f8f8;
+        }
+        img {
+            border-radius: 10px;
+            border: 1px solid #ccc;
+        }
+    </style>
+    </head>
+
+    <body>
+        <h2>Chili Ripeness Detection</h2>
+
+        <div class="container">
+
+            <div class="card">
+                <img id="img" src="/chili/image" width="280" />
+                <p>Status: <span id="status">Loading...</span></p>
+                <p>Total Detected: <span id="total">0</span></p>
+                <p>Ripe (Merah): <span id="ripe">0</span></p>
+                <p>Unripe (Hijau): <span id="unripe">0</span></p>
+            </div>
+
+            <div class="card">
+                <h3>📌 Device Time</h3>
+                <p>Device: <span id="t_device">-</span></p>
+                <p>Datetime: <span id="t_datetime">-</span></p>
+
+                <h3>🌡️ Sensor DHT</h3>
+                <p>Temperature: <span id="s_temp">-</span> °C</p>
+                <p>Humidity: <span id="s_hum">-</span> %</p>
+                <p>Sensor Device: <span id="s_dev">-</span></p>
+            </div>
+
+        </div>
+
+        <script>
+            async function update() {
+                try {
+                    const res = await fetch('/chili/status');
+                    const data = await res.json();
+
+                    let text = "";
+                    if (data.last_pred === 0) text = "RIPE (Merah)";
+                    else if (data.last_pred === 1) text = "UNRIPE (Hijau)";
+                    else text = "No chili detected";
+
+                    document.getElementById("status").innerHTML = text;
+                    document.getElementById("total").innerHTML = data.total_detected;
+                    document.getElementById("ripe").innerHTML = data.ripe;
+                    document.getElementById("unripe").innerHTML = data.unripe;
+
+                    document.getElementById("img").src = '/chili/image?t=' + Date.now();
+
+                    const t = await fetch('/device/time');
+                    const tData = await t.json();
+                    document.getElementById("t_device").innerHTML = tData.last_device ?? "-";
+                    document.getElementById("t_datetime").innerHTML = tData.last_datetime ?? "-";
+
+                    const d = await fetch('/sensor/dht');
+                    const dData = await d.json();
+                    document.getElementById("s_temp").innerHTML = dData.temperature ?? "-";
+                    document.getElementById("s_hum").innerHTML = dData.humidity ?? "-";
+                    document.getElementById("s_dev").innerHTML = dData.device ?? "-";
+
+                } catch (err) {
+                    document.getElementById("status").innerHTML = "No Image";
+                }
+            }
+            setInterval(update, 2000);
+            update();
+        </script>
+
+    </body>
+    </html>
+    """
+
+# =====================================================================
+# Endpoint Waktu
+# =====================================================================
+class TimeData(BaseModel):
+    device: str
+    datetime: str
+
+time_state = {"last_device": None, "last_datetime": None}
+
+@app.post("/device/time")
+def post_time(data: TimeData):
+    time_state.update(data.dict())
+    return {"status": "ok", **data.dict()}
+
+@app.get("/device/time")
+def get_time():
+    return time_state
+
+# =====================================================================
+# Endpoint DHT
+# =====================================================================
+class DHTData(BaseModel):
+    device: str
+    temperature: float
+    humidity: float
+
+dht_state = {"device": None, "temperature": None, "humidity": None}
+
+@app.post("/sensor/dht")
+def post_dht(data: DHTData):
+    dht_state.update(data.dict())
+    return {"status": "ok", **data.dict()}
+
+@app.get("/sensor/dht")
+def get_dht():
+    return dht_state
