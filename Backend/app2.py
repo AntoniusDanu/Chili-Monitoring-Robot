@@ -1,4 +1,6 @@
 import os
+import sqlite3
+from datetime import datetime
 from uuid import uuid4
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
@@ -6,14 +8,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 from pydantic import BaseModel
 from PIL import Image
-import uuid
 
-# ============================================
-# DEFINISIKAN FASTAPI APP  **FIX**
-# ============================================
+
+# ================================================================
+# FASTAPI APP
+# ================================================================
 app = FastAPI()
 
-# Optional CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,16 +22,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================
+
+# ================================================================
 # KONFIGURASI
-# ============================================
+# ================================================================
 UPLOAD_DIR = "chili_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Load YOLO Model
+DB_PATH = "chili.db"
+
+
+# ================================================================
+# DATABASE SETUP
+# ================================================================
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pot_detection (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pot INTEGER,
+            ripe INTEGER,
+            unripe INTEGER,
+            total INTEGER,
+            timestamp TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+init_db()   # create table on startup
+
+
+def save_pot_detection(pot, ripe, unripe, total):
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO pot_detection (pot, ripe, unripe, total, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+    """, (pot, ripe, unripe, total, datetime.now().isoformat()))
+
+    conn.commit()
+    conn.close()
+
+
+# ================================================================
+# YOLO MODEL & STATE
+# ================================================================
 chili_model = YOLO("bestchili.pt")
 
-# State Global
 chili_state = {
     "last_image": None,
     "last_pred": None,
@@ -39,18 +89,34 @@ chili_state = {
     "count_unripe": 0
 }
 
-# ============================================
-# Fungsi preprocessing ROTATE 90°
-# ============================================
+logs_state = []
+current_pot = {"pot": None}
+pot_result = {}
+
+
+# ================================================================
+# LOGGING
+# ================================================================
+def add_log(text):
+    print(text)
+    logs_state.append(text)
+    if len(logs_state) > 200:
+        logs_state.pop(0)
+
+
+# ================================================================
+# IMAGE PROCESSING
+# ================================================================
 def preprocess_and_rotate(image_path):
     img = Image.open(image_path)
     img = img.rotate(-90, expand=True)
     img.save(image_path)
     return image_path
 
-# ============================================
-# Render YOLO Bounding Box
-# ============================================
+
+# ================================================================
+# YOLO RENDER
+# ================================================================
 def save_detected_image(result, src_path):
     try:
         out_path = src_path.replace(".jpg", "_det.jpg")
@@ -60,9 +126,10 @@ def save_detected_image(result, src_path):
         print("Render error:", e)
         return src_path
 
-# ============================================
-# Analisis hasil YOLO
-# ============================================
+
+# ================================================================
+# YOLO ANALYZE
+# ================================================================
 def analyze_chili_boxes(result):
     boxes = result.boxes
     if len(boxes) == 0:
@@ -76,9 +143,10 @@ def analyze_chili_boxes(result):
 
     return best_class, total, ripe, unripe
 
-# ============================================
-# Auto Cleanup
-# ============================================
+
+# ================================================================
+# AUTO CLEANUP
+# ================================================================
 def cleanup_uploads(max_files=100):
     files = sorted(
         [os.path.join(UPLOAD_DIR, f) for f in os.listdir(UPLOAD_DIR)],
@@ -88,11 +156,33 @@ def cleanup_uploads(max_files=100):
         for f in files[:-max_files]:
             os.remove(f)
 
-# ============================================
-# Upload Endpoint
-# ============================================
+
+# ================================================================
+# ENDPOINT POT
+# ================================================================
+class PotData(BaseModel):
+    pot: int
+
+
+@app.post("/pot")
+def post_pot(data: PotData):
+    current_pot["pot"] = data.pot
+    add_log(f"Scanning POT ({data.pot})")
+    return {"status": "ok", "pot": data.pot}
+
+
+# ================================================================
+# UPLOAD DETEKSI CABAI
+# ================================================================
 @app.post("/chili/upload")
 async def upload_chili(file: UploadFile = File(...)):
+
+    # LOGGING
+    add_log("memulai")
+    if current_pot["pot"] is not None:
+        add_log(f"Processing POT {current_pot['pot']}")
+    add_log("Processing")
+
     filename = f"{uuid4()}.jpg"
     filepath = os.path.join(UPLOAD_DIR, filename)
 
@@ -116,18 +206,39 @@ async def upload_chili(file: UploadFile = File(...)):
     chili_state["count_ripe"] = ripe
     chili_state["count_unripe"] = unripe
 
+    pot_id = current_pot["pot"]
+
+    # ================================================================
+    # SIMPAN DATA PER POT (RAM + SQLite)
+    # ================================================================
+    if pot_id is not None:
+
+        # update RAM
+        if pot_id not in pot_result:
+            pot_result[pot_id] = {"ripe": 0, "unripe": 0}
+
+        pot_result[pot_id]["ripe"] += ripe
+        pot_result[pot_id]["unripe"] += unripe
+
+        add_log(f"POT {pot_id} → ripe={pot_result[pot_id]['ripe']} unripe={pot_result[pot_id]['unripe']}")
+
+        # simpan ke SQLite
+        save_pot_detection(pot_id, ripe, unripe, total)
+
     return {
         "status": "ok",
         "ripeness": ripeness,
         "total_detected": total,
         "ripe": ripe,
         "unripe": unripe,
+        "pot": current_pot["pot"],
         "note": "0=ripe, 1=unripe, -1=no chili"
     }
 
-# ============================================
-# Status JSON
-# ============================================
+
+# ================================================================
+# GET STATUS
+# ================================================================
 @app.get("/chili/status")
 def chili_status():
     return {
@@ -138,15 +249,100 @@ def chili_status():
         "note": "0=ripe, 1=unripe, -1=no chili"
     }
 
-# ============================================
-# Endpoint Gambar
-# ============================================
+
+# ================================================================
+# GET POT RESULT (RAM)
+# ================================================================
+@app.get("/pot/result")
+def get_pot_result():
+    return pot_result
+
+
+# ================================================================
+# GET LOG
+# ================================================================
+@app.get("/log")
+def get_log():
+    return logs_state
+
+
+# ================================================================
+# GET IMAGE
+# ================================================================
 @app.get("/chili/image")
 def chili_image():
     if chili_state["last_image"] is None:
         raise HTTPException(status_code=404, detail="No image yet")
     return FileResponse(chili_state["last_image"])
-    
+
+
+# ================================================================
+# SQLITE READ & RESET
+# ================================================================
+@app.get("/pot/db")
+def pot_db():
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM pot_detection ORDER BY id DESC")
+    rows = [dict(row) for row in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+@app.delete("/pot/db/reset")
+def pot_db_reset():
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM pot_detection")
+    conn.commit()
+    conn.close()
+    return {"status": "cleared"}
+
+
+# ================================================================
+# DEVICE TIME API
+# ================================================================
+class TimeData(BaseModel):
+    device: str
+    datetime: str
+
+
+time_state = {"last_device": None, "last_datetime": None}
+
+
+@app.post("/device/time")
+def post_time(data: TimeData):
+    time_state.update(data.dict())
+    return {"status": "ok", **data.dict()}
+
+
+@app.get("/device/time")
+def get_time():
+    return time_state
+
+
+# ================================================================
+# DHT SENSOR API
+# ================================================================
+class DHTData(BaseModel):
+    device: str
+    temperature: float
+    humidity: float
+
+
+dht_state = {"device": None, "temperature": None, "humidity": None}
+
+
+@app.post("/sensor/dht")
+def post_dht(data: DHTData):
+    dht_state.update(data.dict())
+    return {"status": "ok", **data.dict()}
+
+
+@app.get("/sensor/dht")
+def get_dht():
+    return dht_state
+
 # ============================================
 # Halaman Web Viewer
 # ============================================
@@ -243,40 +439,3 @@ def chili_view():
     </body>
     </html>
     """
-
-# =====================================================================
-# Endpoint Waktu
-# =====================================================================
-class TimeData(BaseModel):
-    device: str
-    datetime: str
-
-time_state = {"last_device": None, "last_datetime": None}
-
-@app.post("/device/time")
-def post_time(data: TimeData):
-    time_state.update(data.dict())
-    return {"status": "ok", **data.dict()}
-
-@app.get("/device/time")
-def get_time():
-    return time_state
-
-# =====================================================================
-# Endpoint DHT
-# =====================================================================
-class DHTData(BaseModel):
-    device: str
-    temperature: float
-    humidity: float
-
-dht_state = {"device": None, "temperature": None, "humidity": None}
-
-@app.post("/sensor/dht")
-def post_dht(data: DHTData):
-    dht_state.update(data.dict())
-    return {"status": "ok", **data.dict()}
-
-@app.get("/sensor/dht")
-def get_dht():
-    return dht_state
